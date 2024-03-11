@@ -1,0 +1,283 @@
+
+import numpy as np
+import pandas as pd
+import requests # HTTP library
+from bs4 import BeautifulSoup # Package for scraping
+import time
+import os
+import seaborn
+import matplotlib.pyplot as plt
+from scipy.stats import poisson # Some stats for poisson distribution we will use later on
+
+# Get the basic link for Premier League at FBREF
+standings_url = "https://fbref.com/en/comps/9/Premier-League-Stats"
+
+# Define year 2023
+year = 2023
+
+# Initiate an empty list which will be filled with data from each season
+all_matches = []
+
+
+data = requests.get(standings_url) # HTML request
+soup = BeautifulSoup(data.text) # Initiate a Beautiful Soup object
+standings_table = soup.select('table.stats_table')[0] # Select the first table [0] from the page (there are many others)
+
+links = [l.get('href') for l in standings_table.find_all('a')] # Get all the links per row (on HTML inspect, we can see that those are in the 'a' object)
+links = [l for l in links if '/squads/' in l] # Ensure we access the link which takes us to the page for Team stats
+team_urls = [f"https://fbref.com{l}" for l in links] # Insert the actual team name within the link so we can access the page on Team stats
+
+previous_season = soup.select('a.prev')[0].get('href') # Access the link to the previous season data
+standings_url = f"https://fbref.com{previous_season}" # Ensure that at the end of each year, we will access the previous season, to ensure that we add this to the data
+
+for team_url in team_urls: # Now a second loop within the year loop, which will iterate through all teams and get the Shooting table, which is needed for match information
+    team_name = team_url.split('/')[-1].replace('-Stats', '').replace('-', ' ') # This will be a column we will add to the DataFrame, which will be basically the Team (eg 'Manchester United)
+    data = requests.get(team_url) # Access the HTML for the Team stats page
+    matches = pd.read_html(data.text, match="Scores & Fixtures")[0] # Get the first table under Scores & Fixtures
+    soup = BeautifulSoup(data.text) # Initiate a Beautiful Soup object
+    links = [l.get('href') for l in soup.find_all('a')] # Get all the links for the shooting stats
+    links = [l for l in links if l and 'all_comps/shooting/' in l] # Turn the links into relative links
+    data = requests.get(f"https://fbref.com{links[0]}") # Access the first table under each link on shooting
+    shooting = pd.read_html(data.text, match = 'Shooting') [0] # Get the Shooting Table (first in the list)
+    shooting.columns = shooting.columns.droplevel() # Drop the upper (unnecessary) index
+    try:
+        team_data = matches.merge(shooting[['Date', 'Sh', 'SoT', 'Dist', 'FK', 'PK', 'PKatt']], on = 'Date') # Merge the matches and shooting tables on key 'Date' and get the specified columns
+    except ValueError: # Handle errors in case we don't have any Shooting data for a Team
+        continue # If such an error is found, just continue on to next team
+    team_data = team_data[team_data['Comp'] == 'Premier League'] # Filter the data to contain only PL stats
+    team_data['season'] = year # Assign a column for the season (for easy reading)
+    team_data['team'] = team_name # Assign a column for the team
+    all_matches.append(team_data) # Add the collected data to the all_matches list
+    time.sleep(3) # Pause for 3 seconds after each loop (that's because too many requests at once can block the website)
+
+df_2023 = pd.concat(all_matches)
+
+df_2023.columns = df_2023.columns.str.lower()
+
+# Transfrom date column to datetime and goals and shots to integers:
+
+df_2023['date'] = pd.to_datetime(df_2023['date']) # Change to datetime
+df_2023[['gf', 'ga', 'sh', 'sot', 'fk', 'pk']] = df_2023[['gf', 'ga', 'sh', 'sot', 'fk', 'pk']].astype(int)
+
+
+# Add a column with points won per hame
+
+df_2023['points'] = df_2023['result'].apply(lambda x:
+                                              3 if x == "W" else
+                                              1 if x == "D" else
+                                              0)
+
+# Have a look at all the Teams and Opponents and ensure that the team names are 
+# consistent across the dataset
+
+class MissingDict(dict):
+    __missing__ = lambda self, key:key
+
+map_values = {
+    'Brighton and Hove Albion':'Brighton',
+    'Manchester United': 'Manchester Utd',
+    'Newcastle United': 'Newcastle Utd',
+    'Tottenham Hotspur' : 'Tottenham',
+    'West Ham United' : 'West Ham',
+    'Wolverhampton Wanderers' : 'Wolves',
+    'Nottingham Forest' : "Nott'ham Forest",
+    'Sheffield United' : 'Sheffield Utd',
+    'West Bromwich Albion' : 'West Brom'
+}
+
+mapping = MissingDict(**map_values) # This ensures that if a key from the map_values is passed, it will return its value
+
+
+# Now we need to apply this to the dataset and create new columns for team and opponent
+df_2023['new_team'] = df_2023['team'].map(mapping)
+df_2023['new_opp'] = df_2023['opponent'].map(mapping)
+
+# Drop columns and rename back to team and opponent
+df_2023.drop(columns = ['team', 'opponent'], inplace = True)
+df_2023.rename(columns = {'new_team':'team', 'new_opp' :'opponent'}, inplace = True)
+
+
+# Add a ranking of the opponent (top 6 or no)
+
+top_6 = ('Manchester Utd', 'Manchester City', 'Arsenal', 'Liverpool', 'Chelsea', 'Tottenham')
+
+def opp_ranking(opponent):
+    if opponent in top_6:
+        return 'Top 6 Team'
+    else:
+        return 'non-Top 6 Team'
+df_2023['opponent_ranking'] = df_2023['opponent'].apply(opp_ranking)
+
+# Add three more columns - 'W', 'D', 'L' - which will have a 1 under each instance (for computational purposes)
+df_2023['W'] = np.where(
+    df_2023['result'] == "W", 1, 0
+)
+df_2023['L'] = np.where(
+    df_2023['result'] == 'L', 1, 0
+)
+df_2023['D'] = np.where(
+    df_2023['result'] == 'D', 1, 0
+)
+
+# Save output
+df_2023.to_parquet('Premiear_League_data_2023.parquet') # Save data for purposes
+df_19_22 = pd.read_parquet('Premier_League_data_2019-2022.parquet') # Add data from 19-22 seasons
+match_df = pd.concat([df_19_22, df_2023]) # concatenate
+
+
+# Function to return the standings for each season
+
+def standings(season):
+    df = match_df[match_df['season'] == season]
+    df = df.groupby('team').agg({
+        'points': 'sum',
+        'gf': 'sum',
+        'ga': 'sum',
+        'W': 'sum',
+        'D': 'sum',
+        'L': 'sum',
+        'round': 'count'
+    }).reset_index().sort_values(by = 'points', ascending = False)
+    df.index = np.arange(1, len(df) + 1)
+    df.rename(columns = {'team': 'Team',
+                        'gf': 'Goals Scored',
+                         'ga': 'Goals Against',
+                         'points': 'Points',
+                         'W_sum': 'W',
+                         'D_sum':'D',
+                         'L_sum': 'L',
+                         'round' : 'MP'
+                         }, inplace = True)
+    df['+/-'] = df['Goals Scored'] - df['Goals Against']
+    cols = ['Team', 'MP', 'Points', 'Goals Scored', 'Goals Against',
+            '+/-', 'W', 'D', 'L']
+    df = df[cols]
+    if season == 2023:
+
+        df['Points'] = np.where(df['Team'] == 'Everton', df['Points'] - 10, df['Points']) ### Deduct 10 points, dawg
+        df = df.sort_values(by='Points', ascending=False).reset_index(drop=True)
+        df.index = np.arange(1, len(df) + 1)
+    return df
+
+# standings(2023)
+
+### Define a function to return Team record Home vs Away
+
+def home_away(team, season):
+    df = match_df[(match_df['team'] == team) & (match_df['season'] == season)]
+    df = df.groupby(['team', 'venue']).agg({ 
+        'points': 'sum',
+        'gf': 'mean',
+        'ga': 'mean',
+        'poss': 'mean',
+        'round': 'count',
+        'W':'sum',
+        'D':'sum',
+        'L': 'sum',
+        'sh': 'mean',
+        'sot': 'mean'
+    }).reset_index().set_index(['team', 'venue'])
+    cols = ['round', 'W', 'D', 'L','points', 'gf', 'ga', 'poss', 'sh', 'sot' ]
+    df = df[cols]
+    df.rename(columns = {'round':'MP', 'points':'Points', 'gf': 'Goals Scored', 'ga': 'Goals Against', 'poss': 'Posession', 'sh': 'Shots', 'sot': 'Shots on Target'}, inplace = True)
+    # df['+/-'] = df['Goals Scored'] - df['Goals Against']
+    df[['Posession', 'Shots', 'Goals Scored', 'Goals Against', 'Shots on Target']] = df[['Posession', 'Shots', 'Goals Scored', 'Goals Against', 'Shots on Target']].round(2)
+    return df
+
+# home_away('Manchester Utd', 2023)
+
+### Define a function of how a team performs vs opponent ranking (top 6 or no)
+
+def against_top6(team, season):
+    df = match_df[(match_df['team'] == team) & (match_df['season'] == season)]
+    df = df.groupby(['team', 'opponent_ranking']).agg({ 
+        'gf': 'mean',
+        'ga': 'mean',
+        'points': 'mean',
+        'round': 'count',
+        'W': 'sum',
+        'D': 'sum',
+        'L': 'sum',
+        'poss':'mean',
+        'sh': 'mean',
+        'sot': 'mean'
+    }).reset_index().set_index(['team', 'opponent_ranking'])
+    cols = ['round', 'W', 'D', 'L','points', 'gf', 'ga', 'poss' , 'sh', 'sot']
+    df = df[cols]
+    df.rename(columns = {'round':'MP',
+        'team':'Team',
+        'venue': 'Venue',
+        'gf': 'Goals Scored',
+        'ga': 'Goals Against',
+        'poss': 'Posession',
+        'points': 'AvgPts',
+        'sh': 'Shots', 'sot': 'Shots on Target'
+        }, inplace = True)
+    
+    df['Posession'] = df['Posession'].round(2)
+    df[['AvgPts' ,'Goals Scored', 'Goals Against', 'Shots', 'Shots on Target']] = df[['AvgPts' ,'Goals Scored', 'Goals Against', 'Shots', 'Shots on Target']].round(2)
+    return df
+
+# against_top6('Manchester Utd', 2023)
+
+## Head to Head function which would return the record of H2H since 2019 season
+
+def h2h(team, opponent):
+    team_matches = match_df[(match_df['team'] == team) & (match_df['opponent'] == opponent)]
+    opponent_stats = team_matches.groupby(['opponent', 'venue', ]).agg({
+        'gf': 'mean',
+        'ga': 'mean',
+        'points': 'mean',
+        'round': 'count',
+        'W': 'sum',
+        'D': 'sum',
+        'L': 'sum',
+        'poss':'mean',
+        'sh': 'mean',
+        'sot': 'mean'}).reset_index().set_index(['opponent', 'venue', ])
+    cols = ['round', 'W', 'D', 'L','points', 'gf', 'ga', 'poss', 'sh', 'sot']
+    opponent_stats = opponent_stats[cols]
+    opponent_stats.rename(columns = {'round':'MP', 'points':'AvGPts', 'gf': 'Goals Scored', 'ga': 'Goals Against', 'poss': 'Possession', 'sh': 'Shots', 'sot': 'Shots on Target'}, inplace = True)
+    return opponent_stats
+
+# h2h('Bournemouth', "Aston Villa" )
+
+## This Function uses Poisson Probability Mass Distribution and shows the probability (in %) of a Team scoring exact number of goals Home/Away
+
+
+def team_goal_prob(team, season):
+    team_matches = match_df[(match_df['team'] == team) & (match_df['season'] == season)]
+    team_goal_means = team_matches.groupby(['venue'])['gf'].mean() # Average goals per venue
+    max_goals = team_matches.gf.max() # Max number of goals scored by that team in that season
+    poisson_dist = pd.DataFrame({'goals':range(max_goals + 1)}) # Initiate a DataFrame with one column: number of goals
+    for venue, mean_goals in team_goal_means.items():
+        venue = f"{venue}"
+        poisson_dist[venue] = (poisson.pmf(poisson_dist['goals'], mean_goals) * 100).round(2)
+    poisson_dist.set_index('goals', inplace = True)
+    print(f"{team} probability of scoring exact goals during {season} season:")
+    return poisson_dist
+
+# team_goal_prob('Manchester Utd', 2023) 
+
+
+### Define a function that would return the form of a team - their last 3 matches from season 2023, averages of Goals Scored, Conceited, shots, shots on Target per 90 mins
+
+def team_form(team):
+    team_form = match_df[(match_df['team'] == team) & (match_df['season'] == 2023)].copy()
+    team_form = team_form.sort_values(by='date', ascending=True)
+    last_three_games = team_form.iloc[-3:].copy() # Get the last three games
+    cols = ['gf', 'ga', 'sh', 'sot', 'poss', 'W', 'D', 'L']
+    #new_cols = [f"{c}_rolling" for c in cols]
+    #rolling_stats = team_form[cols].rolling(3, closed = 'left').mean().round(2)
+    #for col, new_col in zip(cols, new_cols):
+        # last_three_games.loc[:, new_col] = rolling_stats.loc[:, col]
+    last_three_games_grouped = last_three_games.groupby('team').agg({
+        'gf':'mean', 'ga':'mean', 'sh':'mean','sot':'mean', 'poss':'mean', 'W':'sum', 'D':'sum', 'L':'sum'
+    })
+    last_three_games_grouped.loc[:, cols] = last_three_games_grouped[cols].round(2)
+    last_three_games_grouped.rename(columns = {'gf' : 'Goals Scored', 'ga':'Goals Against', 'sh': 'Shots', 'sot': 'Shots on Target', 'poss': 'Posession'}, inplace = True)
+    print(f"{team} averages per 90 minutes over the last 3 games")
+
+    return last_three_games_grouped
+
+# team_form('Arsenal')b
